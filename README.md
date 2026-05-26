@@ -46,7 +46,7 @@ osascript -e 'tell application "System Events" to make login item at end with pr
 - `sysctlbyname("vm.swapusage")` — статистика swap
 - `/bin/ps -axo pid=,rss=,comm=` — список процессов с RSS
 
-Меню обновляется при каждом открытии, процент в баре — раз в 5 секунд.
+Меню обновляется при каждом открытии, процент в баре — раз в минуту.
 
 ## Требования
 
