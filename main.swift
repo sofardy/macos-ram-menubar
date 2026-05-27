@@ -25,7 +25,17 @@ struct SwapStats {
 struct ProcInfo {
     let pid: Int
     let rssBytes: UInt64
+    let footprintBytes: UInt64   // phys_footprint = RSS + compressed (approx)
+    let compressedBytes: UInt64  // footprint - rss estimate
     let name: String
+    let path: String
+}
+
+struct AppGroup {
+    let name: String
+    let totalFootprint: UInt64
+    let totalCompressed: UInt64
+    let count: Int
 }
 
 func pageSize() -> UInt64 {
@@ -83,7 +93,40 @@ func getSwapStats() -> SwapStats {
     return SwapStats(total: xsw.xsu_total, used: xsw.xsu_used, free: xsw.xsu_avail)
 }
 
-func getTopProcesses(limit: Int = 10) -> [ProcInfo] {
+func fullPath(forPid pid: Int32) -> String? {
+    // PROC_PIDPATHINFO_MAXSIZE = 4 * MAXPATHLEN = 4096 (macro not importable into Swift)
+    let bufSize = 4096
+    var buffer = [CChar](repeating: 0, count: bufSize)
+    let result = proc_pidpath(pid, &buffer, UInt32(bufSize))
+    guard result > 0 else { return nil }
+    return String(cString: buffer)
+}
+
+func processFootprint(pid: Int32) -> (resident: UInt64, footprint: UInt64)? {
+    var rusage = rusage_info_v4()
+    let result = withUnsafeMutablePointer(to: &rusage) { ptr -> Int32 in
+        ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
+            proc_pid_rusage(pid, RUSAGE_INFO_V4, rebound)
+        }
+    }
+    guard result == 0 else { return nil }
+    return (rusage.ri_resident_size, rusage.ri_phys_footprint)
+}
+
+func appName(forPath path: String) -> String {
+    // Walk path components; the OUTERMOST `.app` is the user-facing app.
+    // e.g. /Applications/Visual Studio Code.app/.../Code Helper (Renderer).app/...
+    // → "Visual Studio Code"
+    for part in path.split(separator: "/") {
+        if part.hasSuffix(".app") {
+            return String(part.dropLast(4))
+        }
+    }
+    // Not a bundled app — fall back to basename
+    return path.split(separator: "/").last.map(String.init) ?? path
+}
+
+func getAllProcesses() -> [ProcInfo] {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/bin/ps")
     task.arguments = ["-axo", "pid=,rss=,comm="]
@@ -96,7 +139,6 @@ func getTopProcesses(limit: Int = 10) -> [ProcInfo] {
     } catch {
         return []
     }
-    // Read BEFORE waiting — otherwise ps blocks on a full pipe and we deadlock
     let data = outPipe.fileHandleForReading.readDataToEndOfFile()
     task.waitUntilExit()
     guard let output = String(data: data, encoding: .utf8) else { return [] }
@@ -109,14 +151,42 @@ func getTopProcesses(limit: Int = 10) -> [ProcInfo] {
         guard parts.count == 3,
               let pid = Int(parts[0]),
               let rssKB = UInt64(parts[1]) else { continue }
-        var name = String(parts[2])
+        let comm = String(parts[2])
+        let path = fullPath(forPid: Int32(pid)) ?? comm
+        var name = comm
         if let slash = name.lastIndex(of: "/") {
             name = String(name[name.index(after: slash)...])
         }
-        procs.append(ProcInfo(pid: pid, rssBytes: rssKB * 1024, name: name))
+        let rssBytes = rssKB * 1024
+        let fp = processFootprint(pid: Int32(pid))
+        let footprint = fp?.footprint ?? rssBytes
+        let compressed = footprint > rssBytes ? (footprint - rssBytes) : 0
+        procs.append(ProcInfo(pid: pid, rssBytes: rssBytes,
+                              footprintBytes: footprint,
+                              compressedBytes: compressed,
+                              name: name, path: path))
     }
-    procs.sort { $0.rssBytes > $1.rssBytes }
-    return Array(procs.prefix(limit))
+    return procs
+}
+
+func getTopApps(limit: Int = 10) -> [AppGroup] {
+    let procs = getAllProcesses()
+    var groups: [String: (footprint: UInt64, compressed: UInt64, count: Int)] = [:]
+    for p in procs {
+        let app = appName(forPath: p.path)
+        let cur = groups[app] ?? (0, 0, 0)
+        groups[app] = (cur.footprint + p.footprintBytes,
+                       cur.compressed + p.compressedBytes,
+                       cur.count + 1)
+    }
+    return groups
+        .map { AppGroup(name: $0.key,
+                        totalFootprint: $0.value.footprint,
+                        totalCompressed: $0.value.compressed,
+                        count: $0.value.count) }
+        .sorted { $0.totalFootprint > $1.totalFootprint }
+        .prefix(limit)
+        .map { $0 }
 }
 
 // MARK: - Formatting
@@ -179,7 +249,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let mem = getMemStats()
         let swap = getSwapStats()
-        let procs = getTopProcesses(limit: 10)
+        let apps = getTopApps(limit: 10)
 
         addInfo("Used       \(formatBytes(mem.realUsed)) / \(formatBytes(mem.total))  (\(Int(mem.realUsedPercent.rounded()))%)")
         addInfo("Available  \(formatBytes(mem.available))")
@@ -200,9 +270,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        addHeader("Top processes by RAM")
-        for p in procs {
-            let line = "\(padLeft(formatBytes(p.rssBytes), 9))  \(p.name)"
+        addHeader("Top apps by Memory       (compressed)")
+        for a in apps {
+            let suffix = a.count > 1 ? "  (×\(a.count))" : ""
+            let cmp = a.totalCompressed >= 1_048_576
+                ? padLeft(formatBytes(a.totalCompressed), 9)
+                : padLeft("—", 9)
+            let line = "\(padLeft(formatBytes(a.totalFootprint), 9))  \(cmp)  \(a.name)\(suffix)"
             addInfo(line)
         }
 
