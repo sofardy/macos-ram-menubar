@@ -169,7 +169,7 @@ func getAllProcesses() -> [ProcInfo] {
     return procs
 }
 
-func getTopApps(limit: Int = 10) -> [AppGroup] {
+func getAllAppGroups() -> [AppGroup] {
     let procs = getAllProcesses()
     var groups: [String: (footprint: UInt64, compressed: UInt64, count: Int)] = [:]
     for p in procs {
@@ -185,8 +185,10 @@ func getTopApps(limit: Int = 10) -> [AppGroup] {
                         totalCompressed: $0.value.compressed,
                         count: $0.value.count) }
         .sorted { $0.totalFootprint > $1.totalFootprint }
-        .prefix(limit)
-        .map { $0 }
+}
+
+func getTopApps(limit: Int = 10) -> [AppGroup] {
+    Array(getAllAppGroups().prefix(limit))
 }
 
 // MARK: - Formatting
@@ -281,6 +283,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let copyItem = NSMenuItem(title: "Copy all apps to clipboard", action: #selector(copyAllAppsAction), keyEquivalent: "c")
+        copyItem.target = self
+        menu.addItem(copyItem)
         let refresh = NSMenuItem(title: "Refresh", action: #selector(rebuildMenuAction), keyEquivalent: "r")
         refresh.target = self
         menu.addItem(refresh)
@@ -290,6 +295,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func rebuildMenuAction() {
         rebuildMenu()
         refreshTitle()
+    }
+
+    @objc func copyAllAppsAction() {
+        let apps = getAllAppGroups()
+        var lines: [String] = []
+        let nameWidth = max(20, apps.map { $0.name.count }.max() ?? 20)
+        lines.append("\(padRight("App", nameWidth))  \(padLeft("Memory", 10))  \(padLeft("Compressed", 10))  Count")
+        lines.append(String(repeating: "-", count: nameWidth + 2 + 10 + 2 + 10 + 2 + 5))
+        for a in apps {
+            let cmp = a.totalCompressed >= 1_048_576 ? formatBytes(a.totalCompressed) : "—"
+            lines.append("\(padRight(a.name, nameWidth))  \(padLeft(formatBytes(a.totalFootprint), 10))  \(padLeft(cmp, 10))  \(a.count)")
+        }
+        let text = lines.joined(separator: "\n")
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
     }
 
     func addInfo(_ text: String) {
